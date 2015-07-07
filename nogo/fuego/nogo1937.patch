@@ -1,0 +1,765 @@
+Index: fuegomain/FuegoMain.cpp
+===================================================================
+--- fuegomain/FuegoMain.cpp	(revision 1937)
++++ fuegomain/FuegoMain.cpp	(working copy)
+@@ -157,7 +157,7 @@
+ {
+     /** Settings from command line options */
+     struct CommandLineOptions options;
+-    options.m_useBook = true;
++    options.m_useBook = false;
+     options.m_allowHandicap = true;
+     options.m_quiet = false;
+ 
+Index: go/GoBoard.h
+===================================================================
+--- go/GoBoard.h	(revision 1937)
++++ go/GoBoard.h	(working copy)
+@@ -1480,31 +1480,9 @@
+ inline bool GoBoard::IsLegal(int p, SgBlackWhite player) const
+ {
+     SG_ASSERT_BW(player);
+-    if (IsPass(p))
+-        return true;
++    SG_ASSERT(! IsPass(p));
+     SG_ASSERT(SgPointUtil::InBoardRange(p));
+-    if (! IsEmpty(p))
+-        return false;
+-    // Suicide
+-    if (! Rules().AllowSuicide() && IsSuicide(p, player))
+-        return false;
+-    // Repetition
+-    if (IsFirst(p))
+-        return true;
+-    if (p == m_state.m_koPoint && m_state.m_toPlay == player)
+-        return (AnyRepetitionAllowed() || KoRepetitionAllowed());
+-    if (Rules().GetKoRule() == GoRules::SIMPLEKO)
+-        return true;
+-    if (IsNewPosition() && ! CanCapture(p, player))
+-        return true;
+-    // None of the easy cases, so check by executing move. Casting away
+-    // const is okay since board is restored to exactly the same state,
+-    // appears const to the client.
+-    GoBoard* bd = const_cast<GoBoard*>(this);
+-    bd->Play(p, player);
+-    bool isLegal = ! LastMoveInfo(GO_MOVEFLAG_ILLEGAL);
+-    bd->Undo();
+-    return isLegal;
++    return IsEmpty(p) && ! IsSuicide(p, player) && ! CanCapture(p, player);
+ }
+ 
+ inline bool GoBoard::IsNewPosition() const
+Index: go/GoGtpEngine.cpp
+===================================================================
+--- go/GoGtpEngine.cpp	(revision 1937)
++++ go/GoGtpEngine.cpp	(working copy)
+@@ -89,7 +89,7 @@
+       m_autoSave(false),
+       m_autoShowBoard(false),
+       m_debugToComment(false),
+-      m_useBook(true),
++      m_useBook(false),
+       m_isPonderPosition(true),
+       m_fixedBoardSize(fixedBoardSize),
+       m_maxClearBoard(-1),
+Index: gouct/GoUctBoard.cpp
+===================================================================
+--- gouct/GoUctBoard.cpp	(revision 1937)
++++ gouct/GoUctBoard.cpp	(working copy)
+@@ -240,9 +240,6 @@
+ {
+     if (bd.Size() != m_size)
+         InitSize(bd);
+-    m_prisoners[SG_BLACK] = bd.NumPrisoners(SG_BLACK);
+-    m_prisoners[SG_WHITE] = bd.NumPrisoners(SG_WHITE);
+-    m_koPoint = bd.KoPoint();
+     m_lastMove = bd.GetLastMove();
+     m_secondLastMove = bd.Get2ndLastMove();
+     m_toPlay = bd.ToPlay();
+@@ -347,8 +344,6 @@
+         b->m_liberties.Exclude(p);
+         if (b->m_color == opp)
+         {
+-            if (b->m_liberties.Length() == 0)
+-                KillBlock(b);
+         }
+         else
+             ownAdjBlocks.PushBack(b);
+@@ -358,8 +353,6 @@
+         b->m_liberties.Exclude(p);
+         if (b->m_color == opp)
+         {
+-            if (b->m_liberties.Length() == 0)
+-                KillBlock(b);
+         }
+         else
+             ownAdjBlocks.PushBack(b);
+@@ -369,8 +362,6 @@
+         b->m_liberties.Exclude(p);
+         if (b->m_color == opp)
+         {
+-            if (b->m_liberties.Length() == 0)
+-                KillBlock(b);
+         }
+         else
+             ownAdjBlocks.PushBack(b);
+@@ -380,50 +371,18 @@
+         b->m_liberties.Exclude(p);
+         if (b->m_color == opp)
+         {
+-            if (b->m_liberties.Length() == 0)
+-                KillBlock(b);
+         }
+         else
+             ownAdjBlocks.PushBack(b);
+     }
+ }
+ 
+-void GoUctBoard::KillBlock(const Block* block)
+-{
+-    SgBlackWhite c = block->m_color;
+-    SgBlackWhite opp = SgOppBW(c);
+-    SgArray<int,SG_MAXPOINT>& nuNeighbors = m_nuNeighbors[c];
+-    for (Block::StoneIterator it(block->m_stones); it; ++it)
+-    {
+-        SgPoint p = *it;
+-        AddLibToAdjBlocks(p, opp);
+-        m_color[p] = SG_EMPTY;
+-        ++m_nuNeighborsEmpty[p - SG_NS];
+-        ++m_nuNeighborsEmpty[p - SG_WE];
+-        ++m_nuNeighborsEmpty[p + SG_WE];
+-        ++m_nuNeighborsEmpty[p + SG_NS];
+-        --nuNeighbors[p - SG_NS];
+-        --nuNeighbors[p - SG_WE];
+-        --nuNeighbors[p + SG_WE];
+-        --nuNeighbors[p + SG_NS];
+-        m_capturedStones.PushBack(p);
+-        m_block[p] = 0;
+-    }
+-    int nuStones = block->m_stones.Length();
+-    m_prisoners[c] += nuStones;
+-    if (nuStones == 1)
+-        // Remember that single stone was captured, check conditions on
+-        // capturing block later
+-        m_koPoint = block->m_anchor;
+-}
+ 
+ void GoUctBoard::Play(SgPoint p)
+ {
+     SG_ASSERT(p >= 0); // No special move, see SgMove
+     SG_ASSERT(p == SG_PASS || (IsValidPoint(p) && IsEmpty(p)));
+     CheckConsistency();
+-    m_koPoint = SG_NULLPOINT;
+-    m_capturedStones.Clear();
+     SgBlackWhite opp = SgOppBW(m_toPlay);
+     if (p != SG_PASS)
+     {
+@@ -432,9 +391,6 @@
+         if (NumNeighbors(p, SG_BLACK) > 0 || NumNeighbors(p, SG_WHITE) > 0)
+             RemoveLibAndKill(p, opp, adjBlocks);
+         UpdateBlocksAfterAddStone(p, m_toPlay, adjBlocks);
+-        if (m_koPoint != SG_NULLPOINT)
+-            if (NumStones(p) > 1 || NumLiberties(p) > 1)
+-                m_koPoint = SG_NULLPOINT;
+         SG_ASSERT(HasLiberties(p)); // Suicide not supported by GoUctBoard
+     }
+     m_secondLastMove = m_lastMove;
+Index: gouct/GoUctBoard.h
+===================================================================
+--- gouct/GoUctBoard.h	(revision 1937)
++++ gouct/GoUctBoard.h	(working copy)
+@@ -165,22 +165,6 @@
+ 
+     bool IsSuicide(SgPoint p) const;
+ 
+-    /** Whether the most recent move captured any stones. */
+-    bool CapturingMove() const;
+-
+-    /** The stones removed from the board by the most recent move.
+-        Can be used for incremental update of other data structures.
+-        Only valid directly after a GoUctBoard::Play, otherwise undefined. */
+-    const GoPointList& CapturedStones() const;
+-
+-    /** The stones captured by the most recent move.
+-        @see CapturedStones */
+-    int NuCapturedStones() const;
+-
+-    /** The total number of stones of 'color' that have been
+-        captured by the opponent throughout the game. */
+-    int NumPrisoners(SgBlackWhite color) const;
+-
+     /** Return last move played.
+         @return The last move played or SG_NULLMOVE, if
+         - No move was played yet
+@@ -317,17 +301,11 @@
+ 
+     SgPoint m_secondLastMove;
+ 
+-    /** Point which is currently illegal for simple Ko rule. */
+-    SgPoint m_koPoint;
+-
+     /** Whose turn it is to play. */
+     SgBlackWhite m_toPlay;
+ 
+     SgArray<Block*,SG_MAXPOINT> m_block;
+ 
+-    /** Number of prisoners of each color */
+-    SgBWArray<int> m_prisoners;
+-
+     /** The current board position. */
+     SgArray<int,SG_MAXPOINT> m_color;
+ 
+@@ -349,8 +327,6 @@
+ 
+     SgMarker m_marker2;
+ 
+-    GoPointList m_capturedStones;
+-
+     SgArray<bool,SG_MAXPOINT> m_isBorder;
+ 
+     /** Not implemented. */
+@@ -383,8 +359,6 @@
+ 
+     void AddStone(SgPoint p, SgBlackWhite c);
+ 
+-    void KillBlock(const Block* block);
+-
+     bool HasLiberties(SgPoint p) const;
+ 
+ public:
+@@ -591,16 +565,6 @@
+     return NumLiberties(block) <= n;
+ }
+ 
+-inline const GoPointList& GoUctBoard::CapturedStones() const
+-{
+-    return m_capturedStones;
+-}
+-
+-inline bool GoUctBoard::CapturingMove() const
+-{
+-    return ! m_capturedStones.IsEmpty();
+-}
+-
+ inline int GoUctBoard::FirstBoardPoint() const
+ {
+     return m_const.FirstBoardPoint();
+@@ -734,17 +698,15 @@
+ inline bool GoUctBoard::IsLegal(int p, SgBlackWhite player) const
+ {
+     SG_ASSERT_BW(player);
+-    if (p == SG_PASS)
+-        return true;
++    SG_ASSERT(p != SG_PASS);
+     SG_ASSERT(SgPointUtil::InBoardRange(p));
+     if (! IsEmpty(p))
+         return false;
+     // Suicide
+     if (IsSuicide(p, player))
+         return false;
+-    // Repetition
+-    if (p == m_koPoint && m_toPlay == player)
+-        return false;
++	if (CanCapture(p, player))
++		return false;
+     return true;
+ }
+ 
+@@ -819,11 +781,6 @@
+     return NumEmptyNeighbors(p) + NumEmptyDiagonals(p);
+ }
+ 
+-inline int GoUctBoard::NuCapturedStones() const
+-{
+-    return m_capturedStones.Length();
+-}
+-
+ inline int GoUctBoard::NumDiagonals(SgPoint p, SgBoardColor c) const
+ {
+     int n = 0;
+@@ -860,11 +817,6 @@
+     return m_nuNeighbors[c][p];
+ }
+ 
+-inline int GoUctBoard::NumPrisoners(SgBlackWhite color) const
+-{
+-    return m_prisoners[color];
+-}
+-
+ inline int GoUctBoard::NumStones(SgPoint block) const
+ {
+     SG_ASSERT(Occupied(block));
+Index: gouct/GoUctDefaultPriorKnowledge.cpp
+===================================================================
+--- gouct/GoUctDefaultPriorKnowledge.cpp	(revision 1937)
++++ gouct/GoUctDefaultPriorKnowledge.cpp	(working copy)
+@@ -491,6 +491,7 @@
+ GoUctDefaultPriorKnowledge::ProcessPosition(std::vector<SgUctMoveInfo>&
+                                             outmoves)
+ {
++    return;
+     if (m_defaultPriorWeight == 0.0)
+         return;
+     m_policy.StartPlayout();
+Index: gouct/GoUctGlobalSearch.h
+===================================================================
+--- gouct/GoUctGlobalSearch.h	(revision 1937)
++++ gouct/GoUctGlobalSearch.h	(working copy)
+@@ -367,6 +367,7 @@
+ SgUctValue GoUctGlobalSearchState<POLICY>::EvaluateBoard(const BOARD& bd,
+                                                          float komi)
+ {
++    /* */ return 0; /* */
+     SgUctValue score;
+     SgPointArray<SgEmptyBlackWhite> scoreBoard;
+     SgPointArray<SgEmptyBlackWhite>* scoreBoardPtr;
+@@ -427,11 +428,6 @@
+ void GoUctGlobalSearchState<POLICY>::ExecutePlayout(SgMove move)
+ {
+     GoUctState::ExecutePlayout(move);
+-    const GoUctBoard& bd = UctBoard();
+-    if (bd.ToPlay() == SG_BLACK)
+-        m_stoneDiff -= bd.NuCapturedStones();
+-    else
+-        m_stoneDiff += bd.NuCapturedStones();
+     m_policy->OnPlay();
+ }
+ 
+@@ -451,27 +447,11 @@
+     const GoBoard& bd = Board();
+     SG_ASSERT(! bd.Rules().AllowSuicide());
+ 
+-    if (GoBoardUtil::TwoPasses(bd))
+-        // Evaluate with Tromp-Taylor (we have no other evaluation that can
+-        // score arbitrary positions). However, if the rules don't require
+-        // CaptureDead(), the two passes need to be played in the search
+-        // sequence. This avoids cases, in which playing a pass (after the
+-        // opponent's last move in the real game was a pass) is only good
+-        // under Tromp-Taylor scoring (see
+-        // regression/sgf/pass/tromp-taylor-pass.sgf).
+-        // Both won't work in Japanese rules, but it is not easy to define
+-        // what a terminal position is in Japanese rules.
+-        if (bd.Rules().CaptureDead()
+-            || bd.MoveNumber() - m_initialMoveNumber >= 2)
+-            return;
+-
+     SgBlackWhite toPlay = bd.ToPlay();
+     for (GoBoard::Iterator it(bd); it; ++it)
+     {
+         SgPoint p = *it;
+         if (  bd.IsEmpty(p)
+-           && ! GoEyeUtil::IsSimpleEye(bd, p, toPlay)
+-           && ! AllSafe(p)
+            && bd.IsLegal(p, toPlay)
+            )
+             moves.push_back(SgUctMoveInfo(p));
+@@ -484,7 +464,6 @@
+     // a bad corner move
+     if (moves.size() > 1)
+         std::swap(moves[0], moves[m_random.SmallInt(moves.size())]);
+-    moves.push_back(SgUctMoveInfo(SG_PASS));
+ }
+ 
+ inline float invsqrt(float value)
+@@ -545,31 +524,12 @@
+                  std::vector<SgUctMoveInfo>& moves,
+                  SgUctProvenType& provenType)
+ {
+-    const GoUctGlobalSearchStateParam& param = m_param.m_searchStateParam;
+-    const GoUctFeatureKnowledgeParam& feParam = m_param.m_featureParam;
++    SG_UNUSED(count);
+     provenType = SG_NOT_PROVEN;
+     moves.clear();  // FIXME: needed?
+     GenerateLegalMoves(moves);
+-    if (! moves.empty() && count == 0) 
+-    {
+-        if (param.m_useTreeFilter)
+-            ApplyFilter(moves);
+-        if (param.m_useDefaultPriorKnowledge)
+-        {
+-            m_priorKnowledge.SetPriorWeight(param.m_defaultPriorWeight);
+-            m_priorKnowledge.ProcessPosition(moves);
+-        }
+-        if (  feParam.m_priorKnowledgeType != PRIOR_NONE
+-           || feParam.m_useAsAdditivePredictor
+-           )
+-        {
+-            SG_ASSERT(m_featureKnowledge);
+-            m_featureKnowledge->Compute(feParam);
+-            if (feParam.m_priorKnowledgeType != PRIOR_NONE)
+-                m_featureKnowledge->SetPriorKnowledge(moves);
+-        }
+-        ApplyAdditivePredictors(moves);
+-    }
++    if (moves.empty())
++        provenType = SG_PROVEN_LOSS;
+     return false;
+ }
+ 
+@@ -577,41 +537,10 @@
+ SgMove GoUctGlobalSearchState<POLICY>::
+ GeneratePlayoutMove(bool& skipRaveUpdate)
+ {
++    SG_UNUSED(skipRaveUpdate);
+     SG_ASSERT(IsInPlayout());
+-    if (m_param.m_searchStateParam.m_mercyRule && CheckMercyRule())
+-        return SG_NULLMOVE;
+     SgPoint move = m_policy->GenerateMove();
+-    SG_ASSERT(move != SG_NULLMOVE);
+-#ifndef NDEBUG
+-    // Check that policy generates pass only if no points are left for which
+-    // GeneratePoint() returns true. See GoUctPlayoutPolicy::GenerateMove()
+-    if (move == SG_PASS)
+-    {
+-        const GoUctBoard& bd = UctBoard();
+-        for (GoUctBoard::Iterator it(bd); it; ++it)
+-            SG_ASSERT(  bd.Occupied(*it)
+-                     || Safe().OneContains(*it)
+-                     || GoBoardUtil::SelfAtari(bd, *it)
+-                     || ! GoUctUtil::GeneratePoint(bd, *it, bd.ToPlay())
+-                     );
+-    }
+-    else
+-        SG_ASSERT(! Safe().OneContains(move));
+-#endif
+-    // The position guaranteed to be a terminal position, which can be
+-    // evaluated with GoBoardUtil::ScoreSimpleEndPosition(), only after two
+-    // passes in a row, both of them generated by GeneratePlayoutMove() in
+-    // the playout phase
+-    if (move == SG_PASS)
+-    {
+-        skipRaveUpdate = true; // Don't update RAVE values for pass moves
+-        if (m_passMovesPlayoutPhase < 2)
+-            ++m_passMovesPlayoutPhase;
+-        else
+-            return SG_NULLMOVE;
+-    }
+-    else
+-        m_passMovesPlayoutPhase = 0;
++    SG_ASSERT(move != SG_PASS);
+     return move;
+ }
+ 
+Index: gouct/GoUctPlayer.h
+===================================================================
+--- gouct/GoUctPlayer.h	(revision 1937)
++++ gouct/GoUctPlayer.h	(working copy)
+@@ -554,9 +554,9 @@
+       m_forcedOpeningMoves(true),
+       m_ignoreClock(false),
+       m_enablePonder(false),
+-      m_useRootFilter(true),
++      m_useRootFilter(false),
+       m_reuseSubtree(true),
+-      m_earlyPass(true),
++      m_earlyPass(false),
+       m_sureWinThreshold(0.80f),
+       m_lastBoardSize(-1),
+       m_maxGames(std::numeric_limits<SgUctValue>::max()),
+@@ -865,24 +865,12 @@
+ 
+     SgPoint move;
+     if (sequence.empty())
+-        move = SG_PASS;
++        move = SG_RESIGN;
+     else
+     {
+         move = *(sequence.begin());
+-        move = GoUctSearchUtil::TrompTaylorPassCheck(move, m_search);
+     }
+ 
+-    // If SgUctSearch aborted early, use the remaining time/nodes for doing a
+-    // search, if an early pass is possible
+-    if (m_earlyPass && (wasEarlyAbort || value > m_sureWinThreshold))
+-    {
+-        maxTime -= timer.GetTime();
+-        SgPoint earlyPassMove;
+-        if (DoEarlyPassSearch(m_maxGames / earlyAbort.m_reductionFactor,
+-                              maxTime, move, earlyPassMove))
+-            move = earlyPassMove;
+-    }
+-
+     m_mpiSynchronizer->SynchronizeMove(move);
+     return move;
+ }
+@@ -946,43 +934,29 @@
+     ++m_statistics.m_nuGenMove;
+     if (m_searchMode == GOUCT_SEARCHMODE_PLAYOUTPOLICY)
+         return GenMovePlayoutPolicy(toPlay);
+-    const GoBoard& bd = Board();
+     SgMove move = SG_NULLMOVE;
+-    if (m_forcedOpeningMoves)
++    double maxTime;
++    if (m_ignoreClock)
++        maxTime = std::numeric_limits<double>::max();
++    else
++        maxTime = m_timeControl.TimeForCurrentMove(time,
++                                                   ! m_writeDebugOutput);
++    if (m_searchMode == GOUCT_SEARCHMODE_ONEPLY)
+     {
+-        move = GoUctUtil::GenForcedOpeningMove(bd);
+-        if (move != SG_NULLMOVE)
+-            SgDebug() << "GoUctPlayer: Forced opening move\n";
++        m_search.SetToPlay(toPlay);
++        SgUctValue ignoreValue;
++        move = m_search.SearchOnePly(m_maxGames, maxTime, ignoreValue);
++        if (move == SG_NULLMOVE)
++            move = SG_RESIGN;
+     }
+-    if (move == SG_NULLMOVE && GoBoardUtil::TrompTaylorPassWins(bd, toPlay))
++    else
+     {
+-        move = SG_PASS;
+-        SgDebug() << "GoUctPlayer: Pass wins (Tromp-Taylor rules)\n";
++        SG_ASSERT(m_searchMode == GOUCT_SEARCHMODE_UCT);
++        move = DoSearch(toPlay, maxTime, false);
++        m_statistics.m_gamesPerSecond.Add(
++                                  m_search.Statistics().m_gamesPerSecond);
+     }
+-    if (move == SG_NULLMOVE)
+-    {
+-        double maxTime;
+-        if (m_ignoreClock)
+-            maxTime = std::numeric_limits<double>::max();
+-        else
+-            maxTime = m_timeControl.TimeForCurrentMove(time,
+-                                                       ! m_writeDebugOutput);
+-        if (m_searchMode == GOUCT_SEARCHMODE_ONEPLY)
+-        {
+-            m_search.SetToPlay(toPlay);
+-            SgUctValue ignoreValue;
+-            move = m_search.SearchOnePly(m_maxGames, maxTime, ignoreValue);
+-            if (move == SG_NULLMOVE)
+-                move = SG_PASS;
+-        }
+-        else
+-        {
+-            SG_ASSERT(m_searchMode == GOUCT_SEARCHMODE_UCT);
+-            move = DoSearch(toPlay, maxTime, false);
+-            m_statistics.m_gamesPerSecond.Add(
+-                                      m_search.Statistics().m_gamesPerSecond);
+-        }
+-    }
++    SG_ASSERT(move != SG_PASS);
+     return move;
+ }
+ 
+Index: gouct/GoUctPlayoutPolicy.h
+===================================================================
+--- gouct/GoUctPlayoutPolicy.h	(revision 1937)
++++ gouct/GoUctPlayoutPolicy.h	(working copy)
+@@ -545,94 +545,7 @@
+ SG_ATTR_FLATTEN SgPoint GoUctPlayoutPolicy<BOARD>::GenerateMove()
+ {
+     m_moves.Clear();
+-    m_checked = false;
+-    SgPoint mv = SG_NULLMOVE;
+-
+-    if (m_param.m_fillboardTries > 0)
+-    {
+-        m_moveType = GOUCT_FILLBOARD;
+-        mv = m_pureRandomGenerator.
+-             GenerateFillboardMove(m_param.m_fillboardTries);
+-    }
+-
+-    m_lastMove = m_bd.GetLastMove();
+-
+-    if (  mv == SG_NULLMOVE
+-       && ! SgIsSpecialMove(m_lastMove) // skip if Pass or Null
+-       && ! m_bd.IsEmpty(m_lastMove) // skip if move was suicide
+-       )
+-    {
+-        if (m_param.m_useNakadeHeuristic && GenerateNakadeMove())
+-        {
+-            m_moveType = GOUCT_NAKADE;
+-            mv = SelectRandom();
+-        }
+-        if (mv == SG_NULLMOVE && GenerateAtariCaptureMove())
+-        {
+-            m_moveType = GOUCT_ATARI_CAPTURE;
+-            mv = SelectRandom();
+-        }
+-        if (mv == SG_NULLMOVE && GenerateAtariDefenseMove())
+-        {
+-            m_moveType = GOUCT_ATARI_DEFEND;
+-            mv = SelectRandom();
+-        }
+-        if (mv == SG_NULLMOVE && GenerateLowLibMove(m_lastMove))
+-        {
+-            m_moveType = GOUCT_LOWLIB;
+-            mv = SelectRandom();
+-        }
+-        if (mv == SG_NULLMOVE)
+-        {
+-        	if (m_param.m_usePatternsInPlayout)
+-            {
+-                m_moveType = GOUCT_GAMMA_PATTERN;
+-                mv = m_gammaGenerator.GenerateBiasedPatternMove();
+-            }
+-            else if (GeneratePatternMove())
+-            {
+-                m_moveType = GOUCT_PATTERN;
+-                mv = SelectRandom();
+-            }
+-        }
+-    }
+-
+-    if (mv != SG_NULLMOVE)
+-        CorrectMove(GoUctUtil::DoFalseEyeToCaptureCorrection, mv,
+-                        GOUCT_REPLACE_CAPTURE);
+-    if (mv == SG_NULLMOVE)
+-    {
+-        m_moveType = GOUCT_CAPTURE;
+-        m_captureGenerator.Generate(m_moves);
+-        mv = SelectRandom();
+-    }
+-    if (mv == SG_NULLMOVE)
+-    {
+-        m_moveType = GOUCT_RANDOM;
+-        mv = m_pureRandomGenerator.Generate();
+-    }
+-    if (mv == SG_NULLMOVE)
+-    {
+-        m_moveType = GOUCT_PASS;
+-        mv = SG_PASS;
+-        m_checked = true;
+-    }
+-    else
+-    {
+-        SG_ASSERT(m_bd.IsLegal(mv));
+-        m_checked = CorrectMove(GoUctUtil::DoSelfAtariCorrection, mv,
+-                                GOUCT_SELFATARI_CORRECTION);
+-        if (USE_CLUMP_CORRECTION && ! m_checked)
+-            CorrectMove(GoUctUtil::DoClumpCorrection, mv,
+-                        GOUCT_CLUMP_CORRECTION);
+-    }
+-    SG_ASSERT(m_bd.IsLegal(mv));
+-    SG_ASSERT(mv == SG_PASS || ! m_bd.IsSuicide(mv));
+-
+-    if (m_param.m_statisticsEnabled)
+-        UpdateStatistics();
+-
+-    return mv;
++    return m_pureRandomGenerator.Generate();
+ }
+ 
+ /** Nakade heuristic.
+Index: gouct/GoUctPureRandomGenerator.h
+===================================================================
+--- gouct/GoUctPureRandomGenerator.h	(revision 1937)
++++ gouct/GoUctPureRandomGenerator.h	(working copy)
+@@ -150,25 +150,35 @@
+ inline SgPoint GoUctPureRandomGenerator<BOARD>::Generate()
+ {
+     CheckConsistency();
+-    SgBlackWhite toPlay = m_bd.ToPlay();
+-    size_t i = m_candidates.size();
+-    while (true)
++	for (int allowpointfill = 0; allowpointfill <= 1; ++allowpointfill)
+     {
+-        if (i == 0)
+-            break;
+-        --i;
+-        SgPoint p = m_candidates[i];
+-        if (! m_bd.IsEmpty(p))
+-        {
+-            m_candidates[i] = m_candidates[m_candidates.size() - 1];
+-            m_candidates.pop_back();
+-            continue;
+-        }
+-        if (GoUctUtil::GeneratePoint(m_bd, p, toPlay))
+-        {
+-            CheckConsistency();
+-            return p;
+-        }
++        bool wasDelete = false;
++        for (size_t i = 0; i < m_candidates.size(); wasDelete || ++i)
++		{
++            wasDelete = false;
++            SgPoint p = m_candidates[i];
++
++			if (m_bd.IsLegal(p))
++			{
++				// don't play where opponent can't, unless there are no other options.
++                if (! allowpointfill && ! m_bd.IsLegal(p, SgOppBW(m_bd.ToPlay())))
++					continue;
++
++				// remove this move from the list, and play it
++				m_candidates[i] = m_candidates[m_candidates.size() - 1];
++				m_candidates.pop_back();
++                wasDelete = true;
++
++				return p;
++			}
++			else if (! m_bd.IsLegal(p, SgOppBW(m_bd.ToPlay())))
++			{
++				// nobody can ever play this move
++				m_candidates[i] = m_candidates[m_candidates.size() - 1];
++				m_candidates.pop_back();
++                wasDelete = true;
++			}
++		}
+     }
+     CheckConsistency();
+     return SG_NULLMOVE;
+@@ -226,15 +236,6 @@
+     if (lastMove != SG_NULLMOVE && lastMove != SG_PASS
+         && ! m_bd.IsEmpty(lastMove))
+         m_nuEmptyFloat -= 1.f;
+-    const GoPointList& capturedStones = m_bd.CapturedStones();
+-    if (! capturedStones.IsEmpty())
+-    {
+-        // Don't remove stone played, too expensive, check later in Generate()
+-        // that generated point is still empty
+-        for (GoPointList::Iterator it(capturedStones); it; ++it)
+-            Insert(*it);
+-        m_nuEmptyFloat += float(capturedStones.Length());
+-    }
+     CheckConsistency();
+ }
+ 
+Index: simpleplayers/SpRandomPlayer.cpp
+===================================================================
+--- simpleplayers/SpRandomPlayer.cpp	(revision 1937)
++++ simpleplayers/SpRandomPlayer.cpp	(working copy)
+@@ -12,10 +12,7 @@
+ 
+ int SpRandomMoveGenerator::Score(SgPoint p)
+ {
+-    if (  m_board.IsEmpty(p)
+-       && m_board.IsLegal(p)
+-       && ! GoEyeUtil::IsSinglePointEye(m_board, p, m_board.ToPlay())
+-       )
++    if (m_board.IsLegal(p))
+         return 1;
+     else
+         return INT_MIN;
+Index: simpleplayers/SpSimplePlayer.cpp
+===================================================================
+--- simpleplayers/SpSimplePlayer.cpp	(revision 1937)
++++ simpleplayers/SpSimplePlayer.cpp	(working copy)
+@@ -68,8 +68,8 @@
+     // Disable(p)
+     m_generator->GenerateMoves(moves, toPlay);
+     // Generate random moves if no other found
+-    if ((moves.BestMove() == SG_PASS) && m_randomGenerator)
+-        m_randomGenerator->GenerateMoves(moves, toPlay);
++    if (moves.BestMove() == SG_PASS)
++    	return SG_RESIGN;
+     return moves.BestMove();
+ }
+ 
+Index: smartgame/SgUctSearch.cpp
+===================================================================
+--- smartgame/SgUctSearch.cpp	(revision 1937)
++++ smartgame/SgUctSearch.cpp	(working copy)
+@@ -1257,8 +1257,7 @@
+     {
+         SgDebug() << MoveString(moves[i].m_move) 
+                   << ' ' << statistics[i].Mean()
+-                  << ", " << statistics[i].Count() << " Simulations"
+-                  << '\n';
++                  << ", " << statistics[i].Count() << " Simulations\n";
+         if (bestMove == SG_NULLMOVE || statistics[i].Mean() > value)
+         {
+             bestMove = moves[i].m_move;

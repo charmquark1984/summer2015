@@ -1,0 +1,2 @@
+boardsize 9
+uct_param_search randomize_rave_frequency 0
